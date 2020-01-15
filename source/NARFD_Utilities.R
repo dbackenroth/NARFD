@@ -1,3 +1,4 @@
+library(nloptr)
 library(splines)
 library(pbs)
 library(refund)
@@ -8,106 +9,106 @@ library(data.table)
 library(glmnet)
 library(mgcv)
 library(tibble)   # provides rownames_to_column
-source("nloptr.R")
+
 options(stringsAsFactors=F)
 
-# inputs:
-#   long--data.frame with columns .index (time value), .id (curve label), 
-#         .observed (observation of curve at that time value)
-#   npc--how many FPCs/functional prototypes to estimate
-#   nbasis--how many spline basis functions to use
-#   type--NARFD of GFPCA
-#   D--how many knots to use in spline basis
-#   seed--integer, seed to use for random initialization
-#   folds--integer, how many folds to use in cross-validation
-#   iter--integer, maximum number of iterations to be used in alternating minimization
-#   periodic--T if the spline basis used should be periodic, F otherwise
-#   penalty.seq--numeric vector of penalty values to try
+# objective for estimating FPC spline coefficients
+Objective3 <- function(x, X, y, pmat, lambda){
+  beta <- x
+  mu <- as.numeric(X %*% beta)
+  log.lik <- sum(y * log(mu+1e-16) - mu)
+  pen.term <- lambda * t(beta) %*% pmat %*% beta
+  objective <- log.lik - pen.term
+  return(-objective)
+}
 
-# returns a list with elements
-#   pred: data.frame with columns 
-#         .index--time value
-#         .id--curve label
-#         .observed--count data
-#         .pred--predicted mean (for GFPCA, after exponentiation)
-#          FPC1, FPC2, ...--contributions to predicted mean from each FPC
-#             (for GFPCA, prior to exponentiation)  [CHECK THIS]
-#   scores: data.frame with columns FPC, .id and Value 
-#           (Value is the estimated score for that FPC and curve)
-#   pcs: data.frame with columns FPCs, .index and Value
-#           (Value is the value of the FPC at the corresponding .index)
-#   penalty: the value of the selected penalty
-#   mean: for NARFD, NA, 
-#   for GFPCA, a data.frame with columns .index and Value
-#      
-RegPath <- function(long, npc, nbasis, type, D, 
-                    seed, folds, iter, periodic, 
-                    penalty.seq){
-  subjs <- unique(long$.id)
-  n.curves <- length(subjs)
-  pred.error <- list()
-  
-  # get spline basis functions
-  if (periodic) bs.func <- pbs else bs.func <- bs
-  Theta <- bs.func(1:D, df=nbasis, intercept=T)
-  # this is for fast access to the spline basis
-  Theta.dt <- GetThetaDt(Theta, unique.points=unique(long$.index))
-  # get initial values
-  set.seed(seed)
-  inits <- GetInits(type=type, long=long, npc=npc, Theta=Theta)
-  # set up folds
-  set.seed(seed)
-  fold.df <- data.table(Curve=subjs, 
-                        Which.fold=sample(rep(1:folds, ceiling(n.curves / folds))[1:n.curves], 
-                                          size=n.curves, 
-                                          replace=F))
-  long <- as.data.table(long)
-  
-  all.errors <- list()
-  for (f in 1:folds){
-    cat("Doing fold", f, "\n")
-    for (i in 1:length(penalty.seq)){
-      p <- penalty.seq[i]
-      cat("penalty", p, "\n")
-      r <- CrossValidate(fold.df=fold.df, f=f, p=p, long=long, 
-                         npc=npc, inits=inits, Theta=Theta, 
-                         type=type, iter=iter, Theta.dt=Theta.dt)
-      this.error <- r$error
-      if (i > 1){
-        fold.errors <- rbind(fold.errors, this.error)
-      } else {
-        fold.errors <- this.error
-      }
+# objective for estimating scores
+Objective4 <- function(x, X, y){
+  beta <- x
+  mu <- as.numeric(X %*% beta)
+  log.lik <- sum(y * log(mu+1e-16) - mu)
+  return(-log.lik)
+}
+
+Gradient3 <- function(x, X, y, pmat, lambda){
+  beta <- x
+  mu <- as.numeric(X %*% beta)
+  grad <- as.matrix(colSums(X * (y / (mu+1e-16) - 1))) - 2 * lambda * pmat %*% beta
+  return(-grad)
+}
+
+Gradient4 <- function(x, X, y){
+  beta <- x
+  mu <- as.numeric(X %*% beta)
+  grad <- as.matrix(colSums(X * (y / (mu+1e-16) - 1)))
+  return(-grad)
+}
+
+# non-negative regression without regularization
+FitNL.noR <- function(X, y, init){
+  LB <- rep(0, length(init))
+  UB <- rep(Inf, length(init))
+  l <- list()
+  obj <- list()
+  # gradient descent with supplied initial values
+  nlopt.fit <- nloptr(x0=init, eval_f=Objective4, 
+                      eval_grad=Gradient4, lb=LB, 
+                      ub=UB, opts=list("algorithm"="NLOPT_LD_LBFGS", 
+                                       "xtol_rel"=1e-04), 
+                      X=X, y=y)
+  l[[1]] <- nlopt.fit$solution
+  obj[[1]] <- Objective4(l[[1]], X, y)
+  # nnlm without initial values
+  l[[2]] <- nnlm(X,
+                   as.matrix(y), 
+                   loss="mkl",
+                   check.x=F)$coefficients[, 1]
+  obj[[2]] <- Objective4(l[[2]], X, y)
+  # nnlm with initial values
+  l[[3]] <- nnlm(X, 
+                    as.matrix(y), loss="mkl", check.x=F, 
+                 init=init)$coefficients[, 1]
+  obj[[3]] <- Objective4(l[[3]], X, y)
+  # nnlm with nnlm.mse initial values
+  nnlm.mse.init <- nnlm(X, as.matrix(y), check.x=F)$coefficients[, 1]
+  l[[4]] <- nnlm(X, as.matrix(y), loss="mkl", check.x=F, 
+                 init=as.matrix(nnlm.mse.init))$coefficients[, 1]
+  obj[[4]] <- Objective4(l[[4]], X, y)
+  # pick the best out of the 4 methods; we use this method since
+  # each method has its own characteristic numerical instabilities
+  selected <- l[[which.min(unlist(obj))]]
+  if (any(y>0 & X %*% matrix(selected)==0)) stop("ZERO PREDICTION!!!!\n")
+  selected
+}
+
+# non-negative regression with regularization
+FitNL <- function(X, y, init, lambda, pmat, type="pcs"){
+  LB <- rep(0, length(init))
+  UB <- rep(Inf, length(init))
+  res <- tryCatch({
+    nloptr(x0=init, eval_f=Objective3, 
+           eval_grad=Gradient3, lb=LB, 
+           ub=UB, opts=list("algorithm"="NLOPT_LD_LBFGS", 
+                            "xtol_rel"=1e-04), 
+           X=X, y=y, lambda=lambda, pmat=pmat)
+  }, error=function(e) {
+    t.file <- tempfile(tmpdir=getwd())
+    cat(t.file, "\n")
+    save(init, LB, UB, X, y, lambda, pmat, 
+         file=t.file)
+
+    stop("Numerical error in BFGS\n")
+  })
+  if (type=="scores"){
+    if (any(res$solution==0) & any(y>0 & (X %*% matrix(res$solution))==0)){
+      nnlm.res <- nnlm(X,
+                     as.matrix(y), 
+                     loss="mkl",
+                     check.x=F)$coefficients[, 1]
+      res$solution <- nnlm.res
     }
-    all.errors[[f]] <- fold.errors
   }
-  errors <- bind_rows(all.errors)
-  
-  error.summ <- group_by(errors, Penalty) %>% summarize(Mean.MKL=mean(mkl)) %>% arrange(Mean.MKL)
-  best.penalty <- filter(error.summ, Mean.MKL==min(Mean.MKL))$Penalty
-  # once the best penalty is fixed, redo with all the data and 
-  # the selected value
-  res.l <- AlternatingFit(dat=long, npc=npc, 
-                          inits=inits,
-                          Theta=Theta, 
-                          type=type, 
-                          iter=iter,
-                          lambda=best.penalty, 
-                          decompose=T)
-  pred <- res.l$pred %>% as.data.frame()
-  pcs <- ProcessPCs(Theta %*% t(res.l$pc.coefs))
-  scores <- ProcessScores(res.l$scores)
-  l <- ReorderAndScale(pred, scores, pcs, type=type)
-  if (type=="GFPCA"){
-    mean <- data.frame(.index=1:nrow(Theta), 
-                       Value=Theta %*% t(res.l$mean.coefs))
-  } else {
-    mean <- NA
-  }
-  # do PCs, do scores, do mean, return pred, return pen.summ and pen
-  list(pred=l$pred, scores=l$scores, pcs=l$pcs, 
-       penalty=best.penalty, 
-       mean=mean)
+  res$solution
 }
 
 EstimateScores <- function(curr.scores, curr.pc.coefs, curr.mean.coefs, 
@@ -181,12 +182,12 @@ EstimatePCs <- function(curr.scores, dat,
   if (type=="GFPCA"){
     init.vals <- as.numeric(t(rbind(curr.mean.coefs, curr.pc.coefs)))
     PenMat = diag(1, nrow=npc + (type=="GFPCA")) %x% 
-        (t(Theta) %*% t(diff) %*% diff %*% Theta)
+      (t(Theta) %*% t(diff) %*% diff %*% Theta)
     
     nl.fit <- gam(Y ~ A - 1, 
-                   paraPen=list(A=list(PenMat, sp=lambda)), 
-                   drop.intercept=T, 
-                   family="poisson", start=init.vals)
+                  paraPen=list(A=list(PenMat, sp=lambda)), 
+                  drop.intercept=T, 
+                  family="poisson", start=init.vals)
     nl.res <- coef(nl.fit)
     new.coefs <- matrix(nl.res, nrow=npc+(type=="GFPCA"), byrow=T)
     new.pc.coefs <- new.coefs[-1, , drop=F]
@@ -242,8 +243,8 @@ Predict <- function(Theta.dt, pc.coefs,
     if (decompose){
       for (cn in cns){
         predict.grid[s, (cn):=as.matrix(Theta.dt[.index, !"gridval"]) %*% 
-                     t(use.coefs[cn, , drop=F]) * 
-                     use.scores[s, cn]]
+                       t(use.coefs[cn, , drop=F]) * 
+                       use.scores[s, cn]]
       }
     }
   }
@@ -274,7 +275,8 @@ AlternatingFit <- function(dat, npc=2,
                            iter=20, 
                            type="NARFD", 
                            tolerance=1e-03, 
-                           lambda, decompose=F){
+                           lambda, decompose=F, 
+                           verbose = F){
   error.iters <- rep(NA, iter+1)
   curr.scores <- inits$scores
   curr.pc.coefs <- inits$coefs.pcs
@@ -295,17 +297,17 @@ AlternatingFit <- function(dat, npc=2,
                        grid=dat, type=type, decompose=F)
   diff <- diff(diag(nrow(Theta)), diff = 2)
   PenMat = diag(1, nrow=npc + (type=="GFPCA")) %x% 
-      (t(Theta) %*% t(diff) %*% diff %*% Theta)
+    (t(Theta) %*% t(diff) %*% diff %*% Theta)
   
   old.err <- GetStats(observed=curr.pred$.observed, 
-             predicted=curr.pred$.pred, print=F)
+                      predicted=curr.pred$.pred, print=F)
   error.iters[1] <- old.err
   for (i in 1:iter){
     obj <- Objective(scores=curr.scores, pc.coefs=curr.pc.coefs, 
                      pred=curr.pred, lambda=lambda, PenMat=PenMat, 
                      mean.coefs=curr.mean.coefs)
-    if (iter==1) cat("\n")
-    cat(i, ":", obj, "..")
+    if (iter==1 & verbose) {cat("\n")}
+    if (verbose) {cat(i, ":", obj, "..")}
     pc.l <- EstimatePCs(curr.scores=curr.scores, dat=dat, 
                         curr.pc.coefs=curr.pc.coefs, 
                         curr.mean.coefs=curr.mean.coefs, 
@@ -322,9 +324,9 @@ AlternatingFit <- function(dat, npc=2,
     if (type=="GFPCA"){
       curr.pcs <- Theta %*% t(curr.pc.coefs)
       orth.curr.pcs <- tryCatch({
-         svd(curr.scores %*% t(curr.pcs))$v[, 1:npc]
+        svd(curr.scores %*% t(curr.pcs))$v[, 1:npc]
       }, error = function(e) {
-         curr.pcs
+        curr.pcs
       })
       proj.matrix <- solve(t(Theta) %*% (Theta)) %*% t(Theta)
       orth.curr.pc.coefs <- proj.matrix %*% orth.curr.pcs
@@ -332,11 +334,11 @@ AlternatingFit <- function(dat, npc=2,
     }
     ptm <- proc.time()
     curr.scores <- EstimateScores(curr.scores=curr.scores, 
-            curr.pc.coefs=curr.pc.coefs, 
-            curr.mean.coefs=curr.mean.coefs,
-            dat=dat, type=type, 
-            Theta.dt=Theta.dt)
-   if (type=="GFPCA"){   # center scores for GFPCA
+                                  curr.pc.coefs=curr.pc.coefs, 
+                                  curr.mean.coefs=curr.mean.coefs,
+                                  dat=dat, type=type, 
+                                  Theta.dt=Theta.dt)
+    if (type=="GFPCA"){   # center scores for GFPCA
       for (j in 1:npc){
         mean.score <- mean(curr.scores[, j])
         curr.scores[, j] <- curr.scores[, j] - mean.score
@@ -348,13 +350,13 @@ AlternatingFit <- function(dat, npc=2,
                          scores=curr.scores,
                          grid=dat, type=type, decompose=F)
     new.err <- GetStats(observed=curr.pred$.observed, 
-                          predicted=curr.pred$.pred, print=F)
+                        predicted=curr.pred$.pred, print=F)
     err.rel.change <- abs((old.err - new.err) / old.err)
     error.iters[i+1] = new.err
     if (err.rel.change < tolerance & i > 5) break
     old.err <- new.err
   }
-  cat("\n")
+  if (verbose){cat("\n")}
   pred <- Predict(Theta.dt=Theta.dt, pc.coefs=curr.pc.coefs, 
                   mean.coefs=curr.mean.coefs, 
                   scores=curr.scores,
@@ -402,17 +404,17 @@ GetInits <- function(type, long, npc, Theta){
   use.subjects <- unique(long$.id)
   if (type=="NARFD"){
     init.scores <- matrix(rnorm(length(use.subjects) * npc), 
-                            nrow=length(use.subjects))^2
+                          nrow=length(use.subjects))^2
     row.names(init.scores) <- use.subjects
     inits <- list(coefs.pcs=matrix(rnorm(nb * npc), nrow=npc)^2, 
-                    scores=init.scores)
+                  scores=init.scores)
   } else if (type=="GFPCA"){
     init.scores <- matrix(rnorm(length(use.subjects) * npc), 
-                            nrow=length(use.subjects))
+                          nrow=length(use.subjects))
     row.names(init.scores) <- use.subjects
     inits <- list(coefs.mean=matrix(rnorm(nb), nrow=1), 
-                    coefs.pcs=matrix(rnorm(nb * npc), nrow=npc), 
-                    scores=init.scores)
+                  coefs.pcs=matrix(rnorm(nb * npc), nrow=npc), 
+                  scores=init.scores)
   }
   if (type=="GFPCA"){   # center scores for GFPCA
     for (j in 1:npc){

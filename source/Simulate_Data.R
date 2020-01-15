@@ -1,4 +1,4 @@
-# Simulate
+# Simulate data using two functional prototypes
  # Inputs
   # N is the number of functional observations
   # D is the number of grid points
@@ -10,10 +10,10 @@
     #               on a grid of length D
     # trajectories: matrix of dimension DxN of means used to simulate
     #               observations using the Poisson distribution
-    # FPCs: FPCs, matrix of dimension Dx2
+    # protoypes: functional prototypes, matrix of dimension Dx2
     # scores: scores, matrix of dimension 2xN
 
-Simulate <- function(N=20, D=144, type="NARFD", seed){
+Simulate <- function(N = 20, D = 144, type = "NARFD", seed){
   set.seed(seed)
   Kp <- 2
   s <- seq(from=0, to=2*pi, length.out=D)
@@ -27,6 +27,7 @@ Simulate <- function(N=20, D=144, type="NARFD", seed){
     stop("Only type=NARFD or GFPCA supported")
   }
   FPCs <- cbind(FPC1, FPC2)
+  colnames(FPCs) <- NULL
   if (type=="NARFD"){
     score.sds <- c(4, 3)
     overall.mean <- matrix(s * 0) 
@@ -46,7 +47,7 @@ Simulate <- function(N=20, D=144, type="NARFD", seed){
   }
   observations <- matrix(rpois(N * D, lambda=subject.mean.matrix), nrow=D, ncol=N)
   list(observations=observations, trajectories=subject.mean.matrix, 
-       scores=scores, FPCs=FPCs)
+       scores=scores, prototypes=FPCs)
 }
 
 # converts wide data frame with observations in columns
@@ -56,8 +57,12 @@ Simulate <- function(N=20, D=144, type="NARFD", seed){
 # in wide
 MakeLong <- function(wide){
   D <- nrow(wide)
+  
   long <- as.data.frame(wide) %>% 
-    mutate(.index=1:D) %>% 
+    mutate(.index = 1:D) %>% 
     gather(.id, .observed, -.index) %>%
-    mutate(.id = paste0("I", .id))
+    mutate(.id = paste0("I", .id)) %>% 
+    as_tibble()
+  
+  long
 }
